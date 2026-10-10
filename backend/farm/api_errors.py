@@ -1,6 +1,6 @@
 """Keep API failures useful and avoid exposing database configuration."""
 from django.core.exceptions import ValidationError
-from django.db import DatabaseError, IntegrityError
+from django.db import DatabaseError, IntegrityError, OperationalError
 from django.http import JsonResponse
 from django.utils.deprecation import MiddlewareMixin
 
@@ -14,9 +14,11 @@ class ApiErrorMiddleware(MiddlewareMixin):
             return JsonResponse({'message': 'Please correct the submitted information.', 'details': details}, status=400)
         if isinstance(exception, IntegrityError):
             return JsonResponse({'message': 'This record conflicts with existing information. Refresh your records and check the submitted details.'}, status=409)
-        if isinstance(exception, DatabaseError):
+        if isinstance(exception, OperationalError):
             return JsonResponse({
                 'message': 'The database connection is temporarily unavailable. If you were saving a record, check whether it was saved before retrying.',
                 'code': 'database_unavailable',
             }, status=503)
+        if isinstance(exception, DatabaseError):
+            return JsonResponse({'message': 'The database could not process this request. Please retry, and contact support if it continues.'}, status=500)
         return None
