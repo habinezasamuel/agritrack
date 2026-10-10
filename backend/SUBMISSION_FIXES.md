@@ -62,7 +62,60 @@ npm.cmd run build
 .\.venv\Scripts\python.exe backend/verify_submission_apis.py
 ```
 
-No schema changes or migrations are required. Automated save and rollback tests
+Migration `farm.0007_meetingsubmission_and_more` adds meeting submission receipts.
+It has been applied to Neon and preserves existing records. Each creation request
+uses a unique submission key. After a timeout, the frontend checks for the
+committed response; repeating the same pending submission returns the original
+meeting. Keys are scoped to the authenticated officer and cannot be reused for
+different details. Saving the meeting, invitations, and receipt is atomic.
+
+Meeting save responses now use the just-created objects instead of querying
+empty attendance registers and histories again. Attendance saves have a bounded
+30-second deadline. Failed requests retain their form data and pending key.
+Pending keys live in memory; after reloading the browser, check the meeting list
+before repeating an uncertain save.
+
+Automated save and rollback tests
 use an isolated SQLite database; they do not create demonstration records in
 Neon. Browser interactions and every existing farm/livestock/input form have
 not been exhaustively tested. Provider billing/quota is a separate issue.
+
+## Automatic attendance marking
+
+Officers select Present, Late, Absent, or Excused beside each farmer. Nearby clicks
+are queued into one save request; newer choices wait behind the current batch.
+Each row shows Waiting to save, Saving, Saved, or Retry. Counts update from the
+database confirmation. Remarks save on leaving the input, and the existing bulk
+save remains available. Finalization is disabled while marks remain pending or
+failed. Finalized registers are read-only for officers.
+
+The totals act as filters. Attendance rate remains calculated as
+`(Present + Late) / Invited * 100`; no numeric farmer scores are introduced.
+
+Automatic saves request a compact response from the existing attendance API.
+After a timeout the client reads the saved statuses and remarks before deciding
+whether confirmation failed. The backend validates the whole batch and updates
+the existing records in a transaction, including officer identity and timestamps.
+Tests cover all four statuses, remarks, persistence on reopening, rate calculation,
+repeated saves without duplicate attendance records, and finalized-register locks.
+No migration is required for these attendance controls.
+
+## Record-loading recovery
+
+Identical simultaneous reads now share one request, scoped to user/token, URL,
+parameters, and timeout. Results are removed on success or failure; completed
+records are never cached. Writes advance the read generation so a post-save
+reload does not reuse a read started before the save. General reads have a
+bounded 30-second timeout; explicit confirmation deadlines remain unchanged.
+
+Register details prefetch their farmer, officer, register, and audit relationships.
+Failed register loads stop the spinner and show an in-modal Retry register button.
+The meeting list has its own Retry loading button.
+
+Database connection attempts now use a 5-second timeout instead of 15 seconds.
+Authentication database failures return a sanitized `503 database_unavailable`
+response before any save handler runs. The HTTP client preserves that message.
+The shared request deadline is 30 seconds. Manual attendance saves use the same
+compact response and read-back confirmation as automatic marks. Finalization
+also checks the saved register after a timeout. Network outages can still
+prevent a save; no success is shown without database confirmation.

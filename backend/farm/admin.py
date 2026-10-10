@@ -7,6 +7,7 @@ from .models import (
     LivestockAnimal, AnimalDiseaseReport, FeedShortageReport, LivestockHealthRecord,
     BananaPlantation, BananaGrowthLog, BananaDiseaseReport, BananaWeatherReport,
     BananaAssistanceRequest, BananaOfficerAdvice,
+    FarmerEvaluation, AttendanceGradingRule,
 )
 
 admin.site.register(UserProfile)
@@ -40,3 +41,5 @@ admin.site.register(BananaDiseaseReport)
 admin.site.register(BananaWeatherReport)
 admin.site.register(BananaAssistanceRequest)
 admin.site.register(BananaOfficerAdvice)
+admin.site.register(FarmerEvaluation)
+admin.site.register(AttendanceGradingRule)

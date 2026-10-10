@@ -781,6 +781,16 @@ export interface AttendanceRecordItem {
   lastModifiedRole?: string;
   adminRemarks?: string;
   updatedAt: string;
+  evaluation?: FarmerEvaluationItem | null;
+}
+
+export interface FarmerEvaluationItem {
+  attendanceMarks: number; attendanceMax: number;
+  participationMarks: number; participationMax: number;
+  activityMarks: number; activityMax: number;
+  practicalMarks: number; practicalMax: number;
+  total: number; maximum: number; percentage: number; grade: string;
+  remarks: string; evaluatedBy: string; updatedAt: string;
 }
 
 export interface AttendanceAuditItem {

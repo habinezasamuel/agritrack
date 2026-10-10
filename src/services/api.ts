@@ -1,4 +1,5 @@
 import axios, { AxiosError, type AxiosInstance, type InternalAxiosRequestConfig } from 'axios';
+import { InflightReads } from './inflightReads';
 import type { LoginCredentials, AuthResponse, User, PaginatedResponse, RegisterData, ApiError } from '../types';
 import type { 
   LivestockAnimal, 
@@ -35,14 +36,16 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true';
 
 const GATEWAY_ERROR_STATUSES = [502, 503, 504];
-const MAX_GATEWAY_RETRIES = 1;
-const REQUEST_TIMEOUT_MS = 20000;
+const MAX_GATEWAY_RETRIES = 2;
+const REQUEST_TIMEOUT_MS = 30000;
 const GATEWAY_RETRY_BASE_DELAY_MS = 1000;
 
 class ApiService {
   private client: AxiosInstance;
   private refreshTokenPromise: Promise<string> | null = null;
   private useMock: boolean;
+  private reads = new InflightReads();
+  private readGeneration = 0;
 
   constructor() {
     this.useMock = USE_MOCK;
@@ -163,7 +166,7 @@ class ApiService {
     return method === 'get' || method === 'head' || method === 'options';
   }
 
-  private formatError(error: AxiosError<ApiError>): Error & { statusCode?: number; details?: Record<string, string[]> } {
+  private formatError(error: AxiosError<ApiError>): Error & { statusCode?: number; details?: Record<string, string[]>; isTimeout: boolean } {
     let message: string;
 
     if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
@@ -171,6 +174,8 @@ class ApiService {
       message = ['get', 'head', 'options'].includes(method)
         ? 'The request timed out. Please try loading the records again.'
         : 'The save request timed out. Check your records before submitting again; the server may have saved it.';
+    } else if (error.response?.data?.code === 'database_unavailable') {
+      message = error.response.data.message;
     } else if (!error.response) {
       message = 'Unable to reach the server. Please check your connection and try again.';
     } else if (this.isTransientServerError(error)) {
@@ -185,7 +190,8 @@ class ApiService {
       }
     }
 
-    const formattedError = new Error(message) as Error & { statusCode?: number; details?: Record<string, string[]> };
+    const formattedError = new Error(message) as Error & { statusCode?: number; details?: Record<string, string[]>; isTimeout: boolean };
+    formattedError.isTimeout = error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT';
 
     formattedError.statusCode = error.response?.status;
     formattedError.details = error.response?.data?.details;
@@ -250,37 +256,41 @@ class ApiService {
       if (!user) throw new Error('Not authenticated');
       return user;
     }
-    const response = await this.client.get<User>('/auth/me');
-    return response.data;
+    return this.get<User>('/auth/me');
   }
 
 
 
-  async get<T>(url: string, params?: Record<string, unknown>): Promise<T> {
+  async get<T>(url: string, params?: Record<string, unknown>, options?: { timeout?: number }): Promise<T> {
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }
-    const response = await this.client.get<T>(url, { params });
-    return response.data;
+    const timeout = options?.timeout ?? 30000;
+    const key = JSON.stringify([this.getAccessToken(), this.getUser()?.id, this.readGeneration, url, params, timeout]);
+    return this.reads.run<T>(key, async () => {
+      const response = await this.client.get<T>(url, { params, timeout });
+      return response.data;
+    });
   }
 
   async getPaginated<T>(url: string, params?: Record<string, unknown>): Promise<PaginatedResponse<T>> {
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }
-    const response = await this.client.get<PaginatedResponse<T>>(url, { params });
-    return response.data;
+    return this.get<PaginatedResponse<T>>(url, params);
   }
 
-  async post<T>(url: string, data?: unknown): Promise<T> {
+  async post<T>(url: string, data?: unknown, options?: { timeout?: number; headers?: Record<string, string> }): Promise<T> {
+    this.readGeneration += 1;
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }
-    const response = await this.client.post<T>(url, data);
+    const response = await this.client.post<T>(url, data, options);
     return response.data;
   }
 
   async put<T>(url: string, data?: unknown): Promise<T> {
+    this.readGeneration += 1;
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }
@@ -289,6 +299,7 @@ class ApiService {
   }
 
   async patch<T>(url: string, data?: unknown): Promise<T> {
+    this.readGeneration += 1;
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }
@@ -297,6 +308,7 @@ class ApiService {
   }
 
   async delete<T>(url: string): Promise<T> {
+    this.readGeneration += 1;
     if (this.useMock) {
       throw new Error('Mock API: use specific mock methods');
     }

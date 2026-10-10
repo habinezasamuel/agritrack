@@ -23,17 +23,34 @@ def verify():
             print('No existing active officer account available for verification.')
             raise SystemExit(1)
         token, _ = generate_tokens_for_user(profile.user)
+        meeting_with_register = None
         for endpoint, collection in (
             ('/api/attendance/meetings/?page=1&page_size=25', 'meetings'),
             ('/api/attendance/farmers-roster/?page=1&page_size=50', 'farmers'),
         ):
             started = perf_counter()
             request = Request('http://127.0.0.1:8000' + endpoint, headers={'Authorization': 'Bearer ' + token})
-            with urlopen(request, timeout=20) as response:
+            with urlopen(request, timeout=30) as response:
                 body = json.load(response)
                 if not isinstance(body.get(collection), list):
                     raise ValueError('Unexpected response contract')
                 print(f'{collection}: HTTP {response.status}; {len(body[collection])} rows on page; {perf_counter() - started:.2f}s')
+                if collection == 'meetings':
+                    meeting_with_register = next((meeting for meeting in body['meetings'] if meeting['has_register']), None)
+        if meeting_with_register:
+            started = perf_counter()
+            request = Request(f"http://127.0.0.1:8000/api/attendance/meetings/{meeting_with_register['id']}/", headers={'Authorization': 'Bearer ' + token})
+            with urlopen(request, timeout=30) as response:
+                body = json.load(response)
+                assert isinstance(body['meeting']['records'], list)
+                print(f'Register details: HTTP {response.status}; {perf_counter() - started:.2f}s')
+            started = perf_counter()
+            request = Request(f"http://127.0.0.1:8000/api/attendance/meetings/{meeting_with_register['id']}/attendance/", headers={'Authorization': 'Bearer ' + token})
+            with urlopen(request, timeout=30) as response:
+                body = json.load(response)
+                assert isinstance(body['records'], list)
+                assert isinstance(body['statistics'], dict)
+                print(f'Attendance confirmation: HTTP {response.status}; {len(body["records"])} saved records; {perf_counter() - started:.2f}s')
         print('Live read-only verification passed. No records were changed.')
     except HTTPError as error:
         print(f'Verification failed: HTTP {error.code}. Check server logs and authentication.')

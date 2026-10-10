@@ -37,7 +37,22 @@ export function OfficerMeetingAttendanceSection() {
 
   // Local state for editable attendance records
   const [editingRecords, setEditingRecords] = useState<Record<number, { status: AttendanceStatus; remarks: string }>>({});
+  const attendanceDrafts = useRef<Record<number, { status: AttendanceStatus; remarks: string }>>({});
   const [isSavingAttendance, setIsSavingAttendance] = useState(false);
+  const attendanceQueue = useRef(new Map<number, { record_id: number; status: AttendanceStatus; remarks: string }>());
+  const attendanceRunning = useRef(false);
+  const attendanceTimer = useRef<number | undefined>(undefined);
+  const [rowSaveState, setRowSaveState] = useState<Record<number, 'pending' | 'saving' | 'saved' | 'error'>>({});
+  const [attendanceFilter, setAttendanceFilter] = useState<AttendanceStatus | 'ALL'>('ALL');
+  const [farmerTableSearch, setFarmerTableSearch] = useState('');
+  const [districtFilter, setDistrictFilter] = useState('ALL');
+  const [sectorFilter, setSectorFilter] = useState('ALL');
+  const [cellFilter, setCellFilter] = useState('ALL');
+  const [villageFilter, setVillageFilter] = useState('ALL');
+  const [farmerSort, setFarmerSort] = useState('name');
+  const [evaluationRecord, setEvaluationRecord] = useState<AttendanceRecordItem | null>(null);
+  const [evaluationForm, setEvaluationForm] = useState({ attendance_marks: 0, attendance_max: 20, participation_marks: 0, participation_max: 30, activity_marks: 0, activity_max: 50, practical_marks: 0, practical_max: 0, remarks: '' });
+  const [evaluationSaving, setEvaluationSaving] = useState(false);
   const [isGeneratingRegister, setIsGeneratingRegister] = useState(false);
   const [isFinalizing, setIsFinalizing] = useState(false);
 
@@ -78,6 +93,7 @@ export function OfficerMeetingAttendanceSection() {
   const loadData = useCallback(async () => {
     try {
       setIsLoading(true);
+      setFeedbackError('');
       const result = await attendanceService.getMeetingsPage(meetingPage);
       setMeetings(result.meetings);
       setMeetingCount(result.count);
@@ -126,12 +142,15 @@ export function OfficerMeetingAttendanceSection() {
   };
 
   const openMeetingRegister = async (meetingId: number, savedMeeting?: MeetingItem) => {
+    if (attendanceRunning.current || attendanceQueue.current.size) return;
     setSelectedMeetingId(meetingId);
     setIsRegisterModalOpen(true);
     setShowReportView(false);
     setFeedbackSuccess('');
     setFeedbackError('');
     setMeetingDetail(null);
+    setRowSaveState({});
+    setAttendanceFilter('ALL');
     try {
       setIsDetailLoading(true);
       const data = savedMeeting || await attendanceService.getMeetingDetail(meetingId);
@@ -146,6 +165,7 @@ export function OfficerMeetingAttendanceSection() {
         };
       });
       setEditingRecords(mapping);
+      attendanceDrafts.current = mapping;
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to load register details.');
     } finally {
@@ -169,6 +189,7 @@ export function OfficerMeetingAttendanceSection() {
         };
       });
       setEditingRecords(mapping);
+      attendanceDrafts.current = mapping;
       setFeedbackSuccess(res.message || 'Attendance register generated successfully using invited farmers!');
       void refreshMeetings();
     } catch (err: any) {
@@ -179,7 +200,43 @@ export function OfficerMeetingAttendanceSection() {
     }
   };
 
+  const flushAttendanceQueue = async () => {
+    if (attendanceRunning.current || !selectedMeetingId || !attendanceQueue.current.size) return;
+    const batch = [...attendanceQueue.current.values()];
+    attendanceQueue.current.clear();
+    attendanceRunning.current = true;
+    setIsSavingAttendance(true);
+    setRowSaveState((previous) => ({ ...previous, ...Object.fromEntries(batch.map((item) => [item.record_id, 'saving'])) }));
+    try {
+      const result = await attendanceService.saveAttendanceMarks(selectedMeetingId, batch);
+      const saved = new Map(result.records.map((record) => [record.id, record]));
+      setMeetingDetail((previous) => previous?.id === result.meetingId ? {
+        ...previous, statistics: result.statistics, status: result.meetingStatus,
+        records: previous.records?.map((record) => saved.has(record.id) ? { ...record, ...saved.get(record.id) } : record),
+      } : previous);
+      setRowSaveState((previous) => ({ ...previous, ...Object.fromEntries(batch.map((item) => {
+        const draft = attendanceDrafts.current[item.record_id];
+        const hasNewChanges = attendanceQueue.current.has(item.record_id) || draft?.status !== item.status || draft?.remarks !== item.remarks;
+        return [item.record_id, hasNewChanges ? 'pending' : 'saved'];
+      })) }));
+      setFeedbackError('');
+    } catch (error: any) {
+      setRowSaveState((previous) => ({ ...previous, ...Object.fromEntries(batch.map((item) => [item.record_id, attendanceQueue.current.has(item.record_id) ? 'pending' : 'error'])) }));
+      setFeedbackError(error.message || 'Attendance could not be saved. Your choices are retained; use Retry on the farmer row.');
+    } finally {
+      attendanceRunning.current = false;
+      if (attendanceQueue.current.size) {
+        attendanceTimer.current = window.setTimeout(() => { void flushAttendanceQueue(); }, 0);
+      } else {
+        setIsSavingAttendance(false);
+      }
+    }
+  };
+
   const handleStatusChange = (recordId: number, status: AttendanceStatus) => {
+    if (meetingDetail?.register?.isFinalized || isFinalizing) return;
+    const remarks = attendanceDrafts.current[recordId]?.remarks || '';
+    attendanceDrafts.current[recordId] = { status, remarks };
     setEditingRecords((prev) => ({
       ...prev,
       [recordId]: {
@@ -187,9 +244,17 @@ export function OfficerMeetingAttendanceSection() {
         status,
       },
     }));
+    attendanceQueue.current.set(recordId, { record_id: recordId, status, remarks });
+    setRowSaveState((previous) => ({ ...previous, [recordId]: 'pending' }));
+    setIsSavingAttendance(true);
+    if (!attendanceRunning.current) {
+      window.clearTimeout(attendanceTimer.current);
+      attendanceTimer.current = window.setTimeout(() => { void flushAttendanceQueue(); }, 400);
+    }
   };
 
   const handleRemarksChange = (recordId: number, remarks: string) => {
+    attendanceDrafts.current[recordId] = { status: attendanceDrafts.current[recordId]?.status || 'UNRECORDED', remarks };
     setEditingRecords((prev) => ({
       ...prev,
       [recordId]: {
@@ -197,10 +262,12 @@ export function OfficerMeetingAttendanceSection() {
         remarks,
       },
     }));
+    setRowSaveState((previous) => ({ ...previous, [recordId]: 'pending' }));
   };
 
   const handleSaveAttendance = async () => {
-    if (!selectedMeetingId) return;
+    if (!selectedMeetingId || attendanceRunning.current || attendanceQueue.current.size) return;
+    attendanceRunning.current = true;
     try {
       setIsSavingAttendance(true);
       setFeedbackError('');
@@ -210,20 +277,49 @@ export function OfficerMeetingAttendanceSection() {
         remarks: val.remarks,
       }));
 
-      const res = await attendanceService.recordAttendance(selectedMeetingId, payload);
-      setMeetingDetail(res.meeting);
-      setFeedbackSuccess(res.message || 'Attendance register saved to Neon PostgreSQL successfully!');
+      const res = await attendanceService.saveAttendanceMarks(selectedMeetingId, payload);
+      const committed = new Map(res.records.map((record) => [record.id, record]));
+      setMeetingDetail((previous) => previous?.id === res.meetingId ? {
+        ...previous, status: res.meetingStatus, statistics: res.statistics,
+        records: previous.records?.map((record) => committed.has(record.id) ? { ...record, ...committed.get(record.id) } : record),
+      } : previous);
+      setRowSaveState(Object.fromEntries(Object.entries(attendanceDrafts.current)
+        .filter(([id, draft]) => attendanceQueue.current.has(Number(id)) || res.records.some((record) => record.id === Number(id) && (record.status !== draft.status || (record.officerRemarks || '') !== draft.remarks)))
+        .map(([id]) => [id, 'pending'])));
+      setFeedbackSuccess('Attendance register saved successfully.');
       void refreshMeetings();
     } catch (err: any) {
       console.error('Failed to save attendance:', err);
       setFeedbackError(err.message || 'Failed to save attendance register.');
     } finally {
-      setIsSavingAttendance(false);
+      attendanceRunning.current = false;
+      if (attendanceQueue.current.size) void flushAttendanceQueue();
+      else setIsSavingAttendance(false);
     }
+  };
+
+  const saveEvaluation = async () => {
+    if (!selectedMeetingId || !evaluationRecord) return;
+    const max = evaluationForm.attendance_max + evaluationForm.participation_max + evaluationForm.activity_max + evaluationForm.practical_max;
+    const total = evaluationForm.attendance_marks + evaluationForm.participation_marks + evaluationForm.activity_marks + evaluationForm.practical_marks;
+    if (total > max || Object.entries(evaluationForm).some(([key, value]) => key !== 'remarks' && (typeof value !== 'number' || value < 0))) {
+      setFeedbackError('Marks must be non-negative and no category can exceed its maximum.'); return;
+    }
+    try {
+      setEvaluationSaving(true); setFeedbackError('');
+      await attendanceService.saveEvaluation(selectedMeetingId, { record_id: evaluationRecord.id, ...evaluationForm });
+      const detail = await attendanceService.getMeetingDetail(selectedMeetingId);
+      setMeetingDetail(detail); setEvaluationRecord(null); setFeedbackSuccess('Farmer evaluation saved.');
+    } catch (error: any) { setFeedbackError(error.message || 'Evaluation could not be saved. Your values are still available in the form.'); }
+    finally { setEvaluationSaving(false); }
   };
 
   const handleFinalizeRegister = async () => {
     if (!selectedMeetingId) return;
+    if (attendanceRunning.current || attendanceQueue.current.size || Object.values(rowSaveState).some((state) => state === 'error' || state === 'pending')) {
+      setFeedbackError('Save all attendance choices and remarks before finalizing the register.');
+      return;
+    }
     if (!window.confirm('Are you sure you want to finalize this attendance register? Once finalized, it will be marked as certified for the meeting.')) {
       return;
     }
@@ -284,6 +380,7 @@ export function OfficerMeetingAttendanceSection() {
     } catch (err: any) {
       console.error('Failed to create meeting:', err);
       setFeedbackError(err.message || 'Failed to create meeting.');
+      if (err.isTimeout) void refreshMeetings();
     } finally {
       meetingSubmission.current = false;
       setIsSubmittingMeeting(false);
@@ -457,6 +554,7 @@ export function OfficerMeetingAttendanceSection() {
         {feedbackError && (
           <div className="m-4 p-3.5 bg-rose-50 border border-rose-300 text-rose-950 rounded-xl text-xs font-semibold flex items-center justify-between">
             <span>⚠ {feedbackError}</span>
+            <Button size="sm" variant="outline" disabled={isLoading || isSavingAttendance} onClick={loadData}>Retry loading</Button>
             <button type="button" onClick={() => setFeedbackError('')} className="text-rose-800">✕</button>
           </div>
         )}
@@ -482,14 +580,19 @@ export function OfficerMeetingAttendanceSection() {
       {/* ============================================================== */}
       <Modal
         isOpen={isRegisterModalOpen}
-        onClose={() => setIsRegisterModalOpen(false)}
-        title={meetingDetail ? `Meeting Attendance: ${meetingDetail.title}` : 'Loading...'}
+        onClose={() => { if (!attendanceRunning.current && !attendanceQueue.current.size && !isSavingAttendance) setIsRegisterModalOpen(false); }}
+        title={meetingDetail ? `Meeting Attendance: ${meetingDetail.title}` : 'Meeting Attendance'}
         size="xl"
       >
-        {isDetailLoading || !meetingDetail ? (
+        {isDetailLoading ? (
           <div className="py-16 text-center text-slate-500">
             <div className="animate-spin w-8 h-8 border-3 border-teal-700 border-t-transparent rounded-full mx-auto mb-3" />
             Loading attendance register from Neon PostgreSQL...
+          </div>
+        ) : !meetingDetail ? (
+          <div role="alert" className="space-y-3 p-4 text-sm text-red-800">
+            <p>{feedbackError || 'The register could not be loaded.'}</p>
+            <Button onClick={() => { if (selectedMeetingId) void openMeetingRegister(selectedMeetingId); }}>Retry register</Button>
           </div>
         ) : (
           <div className="space-y-5">
@@ -624,46 +727,69 @@ export function OfficerMeetingAttendanceSection() {
               /* CASE 2: REGISTER GENERATED - MARKING ATTENDANCE */
               <div className="space-y-4">
                 {/* Statistics Ribbon */}
+                <div className="rounded-xl bg-teal-50 p-3 text-sm text-teal-900">
+                  Choose <strong>Present, Late, Absent, or Excused</strong> next to each farmer. Changes save automatically. Select a total below to filter the list.
+                  <p className="mt-1 text-xs">{meetingDetail.statistics.unrecordedCount} farmers are not marked yet. Attendance rate = (Present + Late) ÷ Invited × 100.</p>
+                </div>
+                {feedbackError && <p role="alert" className="rounded-lg bg-red-50 p-3 text-xs text-red-800">{feedbackError}</p>}
+                {isSavingAttendance && <p role="status" className="text-xs font-semibold text-teal-700">Saving attendance changes... You can keep marking other farmers.</p>}
                 <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-center text-xs">
-                  <div className="bg-slate-100 rounded-lg p-2 border border-slate-200">
+                  <button type="button" onClick={() => setAttendanceFilter('ALL')} aria-pressed={attendanceFilter === 'ALL'} className="bg-slate-100 rounded-lg p-2 border border-slate-200">
                     <div className="font-bold text-slate-500 uppercase text-[10px]">Invited</div>
                     <div className="text-base font-black text-slate-900">{meetingDetail.statistics.totalInvited}</div>
-                  </div>
-                  <div className="bg-emerald-50 rounded-lg p-2 border border-emerald-200">
+                  </button>
+                  <button type="button" onClick={() => setAttendanceFilter('PRESENT')} aria-pressed={attendanceFilter === 'PRESENT'} className="bg-emerald-50 rounded-lg p-2 border border-emerald-200">
                     <div className="font-bold text-emerald-700 uppercase text-[10px]">Present</div>
                     <div className="text-base font-black text-emerald-800">{meetingDetail.statistics.presentCount}</div>
-                  </div>
-                  <div className="bg-amber-50 rounded-lg p-2 border border-amber-200">
+                  </button>
+                  <button type="button" onClick={() => setAttendanceFilter('LATE')} aria-pressed={attendanceFilter === 'LATE'} className="bg-amber-50 rounded-lg p-2 border border-amber-200">
                     <div className="font-bold text-amber-700 uppercase text-[10px]">Late</div>
                     <div className="text-base font-black text-amber-800">{meetingDetail.statistics.lateCount}</div>
-                  </div>
-                  <div className="bg-rose-50 rounded-lg p-2 border border-rose-200">
+                  </button>
+                  <button type="button" onClick={() => setAttendanceFilter('ABSENT')} aria-pressed={attendanceFilter === 'ABSENT'} className="bg-rose-50 rounded-lg p-2 border border-rose-200">
                     <div className="font-bold text-rose-700 uppercase text-[10px]">Absent</div>
                     <div className="text-base font-black text-rose-800">{meetingDetail.statistics.absentCount}</div>
-                  </div>
-                  <div className="bg-sky-50 rounded-lg p-2 border border-sky-200">
+                  </button>
+                  <button type="button" onClick={() => setAttendanceFilter('EXCUSED')} aria-pressed={attendanceFilter === 'EXCUSED'} className="bg-sky-50 rounded-lg p-2 border border-sky-200">
                     <div className="font-bold text-sky-700 uppercase text-[10px]">Excused</div>
                     <div className="text-base font-black text-sky-800">{meetingDetail.statistics.excusedCount}</div>
-                  </div>
+                  </button>
                   <div className="bg-purple-50 rounded-lg p-2 border border-purple-200">
-                    <div className="font-bold text-purple-700 uppercase text-[10px]">Rate</div>
+                    <div className="font-bold text-purple-700 uppercase text-[10px]">Attendance Rate</div>
                     <div className="text-base font-black text-purple-800">{meetingDetail.statistics.attendanceRate}%</div>
                   </div>
                 </div>
+                <div className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+                  <span className="font-semibold text-slate-700">{meetingDetail.statistics.totalInvited - meetingDetail.statistics.unrecordedCount} of {meetingDetail.statistics.totalInvited} farmers marked · {meetingDetail.statistics.totalInvited ? Math.round((meetingDetail.statistics.totalInvited - meetingDetail.statistics.unrecordedCount) / meetingDetail.statistics.totalInvited * 100) : 0}% complete</span>
+                  {meetingDetail.statistics.unrecordedCount > 0 && <button type="button" onClick={() => { setAttendanceFilter('UNRECORDED'); setFarmerTableSearch(''); }} className="font-bold text-teal-800 underline">Jump to unmarked</button>}
+                </div>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                  <input aria-label="Search farmers" value={farmerTableSearch} onChange={(event) => setFarmerTableSearch(event.target.value)} placeholder="Search name or registration ID" className="rounded-lg border border-slate-300 px-3 py-2 text-sm col-span-2" />
+                  <select aria-label="Sort farmers" value={farmerSort} onChange={(event) => setFarmerSort(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="name">Sort: Name</option><option value="registration">Sort: Registration ID</option><option value="status">Sort: Status</option></select>
+                  {(['district', 'sector', 'cell', 'village'] as const).map((field) => {
+                    const values = [...new Set((meetingDetail.records || []).map((record) => record.farmer[field]).filter(Boolean))].sort();
+                    const selected = field === 'district' ? districtFilter : field === 'sector' ? sectorFilter : field === 'cell' ? cellFilter : villageFilter;
+                    const setter = field === 'district' ? setDistrictFilter : field === 'sector' ? setSectorFilter : field === 'cell' ? setCellFilter : setVillageFilter;
+                    return <select key={field} aria-label={`Filter by ${field}`} value={selected} onChange={(event) => setter(event.target.value)} className="rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="ALL">All {field}s</option>{values.map((value) => <option key={value} value={value}>{value}</option>)}</select>;
+                  })}
+                </div>
+                {attendanceFilter !== 'ALL' && <div className="flex items-center gap-3 text-xs">Showing {attendanceFilter.toLowerCase()} farmers <button type="button" onClick={() => setAttendanceFilter('ALL')} className="font-bold text-teal-700 underline">Show all farmers</button></div>}
 
                 {/* Table for Marking Attendance */}
-                <div className="border border-slate-200 rounded-xl overflow-hidden shadow-xs">
+                <div className="border border-slate-200 rounded-xl overflow-x-auto shadow-xs">
                   <table className="min-w-full divide-y divide-slate-200 text-left text-xs">
                     <thead className="bg-slate-50 font-bold text-slate-700">
                       <tr>
                         <th className="py-2.5 px-3">Farmer & Reg ID</th>
                         <th className="py-2.5 px-3">Administrative Location</th>
                         <th className="py-2.5 px-3 min-w-[260px]">Attendance Status</th>
+                        <th className="py-2.5 px-3">Marks</th>
                         <th className="py-2.5 px-3">Officer Remarks</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 bg-white">
-                      {meetingDetail.records?.map((rec: AttendanceRecordItem) => {
+                      {!meetingDetail.records?.some((record) => (attendanceFilter === 'ALL' || record.status === attendanceFilter) && `${record.farmer.name} ${record.farmer.registrationId}`.toLowerCase().includes(farmerTableSearch.toLowerCase()) && (districtFilter === 'ALL' || record.farmer.district === districtFilter) && (sectorFilter === 'ALL' || record.farmer.sector === sectorFilter) && (cellFilter === 'ALL' || record.farmer.cell === cellFilter) && (villageFilter === 'ALL' || record.farmer.village === villageFilter)) && <tr><td colSpan={5} className="p-4 text-center text-slate-500">No farmers match these filters.</td></tr>}
+                      {meetingDetail.records?.filter((record) => (attendanceFilter === 'ALL' || record.status === attendanceFilter) && `${record.farmer.name} ${record.farmer.registrationId}`.toLowerCase().includes(farmerTableSearch.toLowerCase()) && (districtFilter === 'ALL' || record.farmer.district === districtFilter) && (sectorFilter === 'ALL' || record.farmer.sector === sectorFilter) && (cellFilter === 'ALL' || record.farmer.cell === cellFilter) && (villageFilter === 'ALL' || record.farmer.village === villageFilter)).sort((a, b) => farmerSort === 'registration' ? a.farmer.registrationId.localeCompare(b.farmer.registrationId) : farmerSort === 'status' ? a.status.localeCompare(b.status) : a.farmer.name.localeCompare(b.farmer.name)).map((rec: AttendanceRecordItem) => {
                         const current = editingRecords[rec.id] || { status: rec.status, remarks: rec.officerRemarks || '' };
                         return (
                           <tr key={rec.id} className="hover:bg-slate-50/70 transition-colors">
@@ -679,6 +805,11 @@ export function OfficerMeetingAttendanceSection() {
                                 {rec.farmer.cell} · {rec.farmer.village}
                               </div>
                             </td>
+                            <td className="py-2.5 px-3 whitespace-nowrap">
+                              <div className="font-bold text-slate-800">{rec.evaluation ? `${rec.evaluation.total}/${rec.evaluation.maximum} (${rec.evaluation.percentage}%)` : 'Not evaluated'}</div>
+                              {rec.evaluation && <div className="text-[10px] text-slate-500">{rec.evaluation.grade}</div>}
+                              <button type="button" disabled={meetingDetail.register?.isFinalized} onClick={() => { setEvaluationRecord(rec); setEvaluationForm(rec.evaluation ? { attendance_marks: rec.evaluation.attendanceMarks, attendance_max: rec.evaluation.attendanceMax, participation_marks: rec.evaluation.participationMarks, participation_max: rec.evaluation.participationMax, activity_marks: rec.evaluation.activityMarks, activity_max: rec.evaluation.activityMax, practical_marks: rec.evaluation.practicalMarks, practical_max: rec.evaluation.practicalMax, remarks: rec.evaluation.remarks } : { attendance_marks: 0, attendance_max: 20, participation_marks: 0, participation_max: 30, activity_marks: 0, activity_max: 50, practical_marks: 0, practical_max: 0, remarks: '' }); }} className="mt-1 text-[11px] font-bold text-teal-800 underline">Award marks</button>
+                            </td>
                             <td className="py-2.5 px-3">
                               <div className="flex items-center gap-1.5 flex-wrap">
                                 {(['PRESENT', 'LATE', 'ABSENT', 'EXCUSED'] as AttendanceStatus[]).map((st) => (
@@ -686,6 +817,9 @@ export function OfficerMeetingAttendanceSection() {
                                     type="button"
                                     key={st}
                                     onClick={() => handleStatusChange(rec.id, st)}
+                                    disabled={meetingDetail.register?.isFinalized || isFinalizing}
+                                    aria-pressed={current.status === st}
+                                    aria-label={`Mark ${rec.farmer.name} ${st.toLowerCase()}`}
                                     className={`px-2.5 py-1 rounded-md text-[11px] font-extrabold transition-all ${
                                       current.status === st
                                         ? st === 'PRESENT'
@@ -702,6 +836,13 @@ export function OfficerMeetingAttendanceSection() {
                                   </button>
                                 ))}
                               </div>
+                              <div role="status" className="mt-2 text-[11px]">
+                                {rowSaveState[rec.id] === 'pending' && <span className="text-amber-700">Waiting to save...</span>}
+                                {rowSaveState[rec.id] === 'saving' && <span className="text-teal-700">Saving...</span>}
+                                {rowSaveState[rec.id] === 'saved' && <span className="font-semibold text-emerald-700">Saved</span>}
+                                {rowSaveState[rec.id] === 'error' && <span className="text-red-700">Save not confirmed. <button type="button" onClick={() => handleStatusChange(rec.id, current.status)} className="font-bold underline">Retry</button></span>}
+                                {!rowSaveState[rec.id] && rec.status === 'UNRECORDED' && <span className="text-slate-500">Not marked</span>}
+                              </div>
 
                               {rec.isModifiedByAdmin && (
                                 <div className="mt-1.5 text-[10px] bg-amber-50 text-amber-900 border border-amber-200 p-1 rounded font-medium flex items-center gap-1">
@@ -716,6 +857,8 @@ export function OfficerMeetingAttendanceSection() {
                                 placeholder="Add remark..."
                                 value={current.remarks}
                                 onChange={(e) => handleRemarksChange(rec.id, e.target.value)}
+                                onBlur={() => { if (current.remarks !== (rec.officerRemarks || '')) handleStatusChange(rec.id, current.status); }}
+                                disabled={meetingDetail.register?.isFinalized || isFinalizing}
                                 className="w-full text-xs p-1.5 rounded border border-slate-200 focus:ring-1 focus:ring-teal-600 focus:outline-none"
                               />
                             </td>
@@ -770,7 +913,7 @@ export function OfficerMeetingAttendanceSection() {
                         variant="outline"
                         size="sm"
                         onClick={handleFinalizeRegister}
-                        disabled={isFinalizing}
+                        disabled={isFinalizing || isSavingAttendance || Object.values(rowSaveState).some((state) => state === 'error' || state === 'pending')}
                         className="text-xs font-semibold text-emerald-800 hover:bg-emerald-50"
                       >
                         {isFinalizing ? 'Finalizing...' : '✓ Finalize Register'}
@@ -785,6 +928,24 @@ export function OfficerMeetingAttendanceSection() {
       </Modal>
 
       {/* ============================================================== */}
+      <Modal isOpen={!!evaluationRecord} onClose={() => { if (!evaluationSaving) setEvaluationRecord(null); }} title={`Award marks · ${evaluationRecord?.farmer.name || ''}`}>
+        <div className="space-y-4">
+          <p className="text-xs text-slate-600">Evaluation is independent of attendance. A present status does not award marks automatically. Category maxima configure the total score.</p>
+          <div className="grid grid-cols-2 gap-3">
+            {([
+              ['Attendance', 'attendance_marks', 'attendance_max'], ['Participation', 'participation_marks', 'participation_max'],
+              ['Farming activity / training', 'activity_marks', 'activity_max'], ['Practical knowledge', 'practical_marks', 'practical_max'],
+            ] as const).map(([label, marks, maximum]) => <div key={marks} className="rounded-lg border border-slate-200 p-3">
+              <label className="block text-xs font-bold text-slate-700">{label} marks</label>
+              <div className="mt-2 flex items-center gap-2"><input type="number" min="0" max={evaluationForm[maximum]} step="0.5" value={evaluationForm[marks]} onChange={(event) => setEvaluationForm((form) => ({ ...form, [marks]: Number(event.target.value) }))} className="w-full rounded border border-slate-300 px-2 py-1.5" /><span>/</span><input aria-label={`${label} maximum marks`} type="number" min="0" step="0.5" value={evaluationForm[maximum]} onChange={(event) => setEvaluationForm((form) => ({ ...form, [maximum]: Number(event.target.value) }))} className="w-20 rounded border border-slate-300 px-2 py-1.5" /></div>
+            </div>)}
+          </div>
+          <label className="block text-xs font-bold text-slate-700">Evaluation remarks<textarea value={evaluationForm.remarks} onChange={(event) => setEvaluationForm((form) => ({ ...form, remarks: event.target.value }))} rows={3} className="mt-1 w-full rounded-lg border border-slate-300 p-2 font-normal" /></label>
+          <div className="flex items-center justify-between rounded-lg bg-emerald-50 px-3 py-2 text-sm"><strong>Total: {evaluationForm.attendance_marks + evaluationForm.participation_marks + evaluationForm.activity_marks + evaluationForm.practical_marks} / {evaluationForm.attendance_max + evaluationForm.participation_max + evaluationForm.activity_max + evaluationForm.practical_max}</strong><span>{(evaluationForm.attendance_max + evaluationForm.participation_max + evaluationForm.activity_max + evaluationForm.practical_max) ? Math.round(((evaluationForm.attendance_marks + evaluationForm.participation_marks + evaluationForm.activity_marks + evaluationForm.practical_marks) / (evaluationForm.attendance_max + evaluationForm.participation_max + evaluationForm.activity_max + evaluationForm.practical_max)) * 100) : 0}%</span></div>
+          <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setEvaluationRecord(null)} disabled={evaluationSaving}>Cancel</Button><Button variant="primary" onClick={saveEvaluation} disabled={evaluationSaving}>{evaluationSaving ? 'Saving...' : 'Save evaluation'}</Button></div>
+        </div>
+      </Modal>
+
       {/* CREATE MEETING MODAL */}
       {/* ============================================================== */}
       <Modal

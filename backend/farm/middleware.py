@@ -1,4 +1,5 @@
 from django.http import JsonResponse
+from django.db import DatabaseError
 from .auth_utils import get_authenticated_user
 
 class BearerTokenAuthMiddleware:
@@ -12,10 +13,18 @@ class BearerTokenAuthMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        if not getattr(request, 'user', None) or not request.user.is_authenticated:
-            user = get_authenticated_user(request)
-            if user:
-                request.user = user
+        try:
+            if not getattr(request, 'user', None) or not request.user.is_authenticated:
+                user = get_authenticated_user(request)
+                if user:
+                    request.user = user
+        except DatabaseError:
+            if request.path.startswith(('/api/', '/auth/', '/livestock/', '/banana/', '/farm/', '/ai/')):
+                return JsonResponse({
+                    'message': 'The database connection is temporarily unavailable. If you were saving a record, check whether it was saved before retrying.',
+                    'code': 'database_unavailable',
+                }, status=503)
+            raise
 
         response = self.get_response(request)
 

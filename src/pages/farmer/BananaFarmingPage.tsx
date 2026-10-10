@@ -194,23 +194,15 @@ export function BananaFarmingPage() {
     setIsLoading(true);
     setLoadError('');
     try {
-      const [summaryData, plantationsData, growthData, diseaseData, weatherData, requestsData] = await Promise.all([
-        bananaService.getDashboardSummary(),
-        bananaService.getPlantations(),
-        bananaService.getGrowthRecords(),
-        bananaService.getDiseaseReports(),
-        bananaService.getWeatherReports(),
-        bananaService.getAssistanceRequests(),
-      ]);
-      setSummary(summaryData);
-      setPlantations(plantationsData);
-      setGrowthRecords(growthData);
-      setDiseaseReports(diseaseData);
-      setWeatherReports(weatherData);
-      setAssistanceRequests(requestsData);
+      const data = await bananaService.getDashboardData();
+      setSummary(data.summary);
+      setPlantations(data.plantations);
+      setGrowthRecords(data.growthRecords);
+      setDiseaseReports(data.diseaseReports);
+      setWeatherReports(data.weatherReports);
+      setAssistanceRequests(data.assistanceRequests);
     } catch (e) {
-      setLoadError('Unable to load banana farming records. Check your connection and try again.');
-      setSummary(null);
+      setLoadError(e instanceof Error ? e.message : 'Unable to load banana farming records. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -645,7 +637,7 @@ export function BananaFarmingPage() {
       {isLoading && <p role="status">Loading banana farming records...</p>}
       {loadError && <div role="alert" className="rounded-xl bg-red-50 p-4 text-red-800">{loadError} <Button onClick={reloadData}>Retry</Button></div>}
       {!isLoading && !loadError && summary?.totalPlantations === 0 && <p>No banana fields have been recorded yet. Register a field to get started.</p>}
-      {activeTab === 'overview' && !isLoading && !loadError && summary && (
+      {activeTab === 'overview' && !isLoading && summary && (
         <div className="space-y-6">
           {/* 8 Stats KPI Cards */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -798,7 +790,7 @@ export function BananaFarmingPage() {
               {plantations.map((p) => (
                 <Card key={p.id} className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-sm hover:shadow-md transition">
                   <div className="h-40 relative overflow-hidden bg-slate-100">
-                    <img src={p.photoUrl || bananaPhoto} alt={p.fieldName} className="w-full h-full object-cover" />
+                    <img loading="lazy" decoding="async" src={p.photoUrl || bananaPhoto} alt={p.fieldName} className="w-full h-full object-cover" />
                     <span className="absolute top-3 right-3 rounded-full bg-black/60 px-3 py-1 text-xs font-bold text-white backdrop-blur-md">
                       {p.status}
                     </span>
@@ -866,7 +858,7 @@ export function BananaFarmingPage() {
             {filteredPlantations.map((p) => (
               <Card key={p.id} className="rounded-3xl border border-slate-200 bg-white overflow-hidden shadow-sm hover:shadow-lg transition">
                 <div className="h-48 relative overflow-hidden bg-slate-100">
-                  <img src={p.photoUrl || bananaPhoto} alt={p.fieldName} className="w-full h-full object-cover" />
+                  <img loading="lazy" decoding="async" src={p.photoUrl || bananaPhoto} alt={p.fieldName} className="w-full h-full object-cover" />
                   <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent" />
                   <div className="absolute bottom-3 left-4 right-4 flex items-end justify-between text-white">
                     <div>
@@ -966,7 +958,7 @@ export function BananaFarmingPage() {
               <Card key={record.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm hover:shadow-md transition">
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                   <div className="flex items-start gap-4">
-                    <img
+                    <img loading="lazy" decoding="async"
                       src={record.photos[0] || bananaPhoto}
                       alt="Banana growth"
                       className="w-20 h-20 rounded-2xl object-cover border border-slate-200 shadow-sm flex-shrink-0"
@@ -1034,7 +1026,7 @@ export function BananaFarmingPage() {
               <Card key={report.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
                 <div className="flex items-start justify-between">
                   <div className="flex items-center gap-3">
-                    <img src={report.photos[0] || bananaPhoto} alt="Reported problem" className="w-16 h-16 rounded-xl object-cover border" />
+                    <img loading="lazy" decoding="async" src={report.photos[0] || bananaPhoto} alt="Reported problem" className="w-16 h-16 rounded-xl object-cover border" />
                     <div>
                       <span className="text-[10px] font-black uppercase text-slate-400">{report.reportNumber} • {report.reportDate}</span>
                       <h4 className="text-base font-black text-slate-900">{report.problemTypeName || report.problemType}</h4>
@@ -1133,7 +1125,7 @@ export function BananaFarmingPage() {
                 </div>
 
                 <div className="h-32 rounded-xl overflow-hidden bg-slate-100 relative">
-                  <img src={w.photos[0] || rainPhoto} alt="Weather incident" className="w-full h-full object-cover" />
+                  <img loading="lazy" decoding="async" src={w.photos[0] || rainPhoto} alt="Weather incident" className="w-full h-full object-cover" />
                   {w.rainfallMm && (
                     <span className="absolute bottom-2 right-2 rounded-lg bg-black/70 px-2 py-0.5 text-xs font-bold text-white">
                       💧 {w.rainfallMm} mm
@@ -1284,7 +1276,7 @@ export function BananaFarmingPage() {
                     </div>
 
                     {evt.photo && (
-                      <img src={evt.photo} alt="Timeline step" className="w-14 h-14 rounded-xl object-cover border" />
+                      <img loading="lazy" decoding="async" src={evt.photo} alt="Timeline step" className="w-14 h-14 rounded-xl object-cover border" />
                     )}
                   </div>
 

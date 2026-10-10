@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 import dj_database_url
+from corsheaders.defaults import default_headers
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -68,6 +69,7 @@ MIDDLEWARE = [
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [*default_headers, 'idempotency-key']
 
 ROOT_URLCONF = 'agritrack.urls'
 
@@ -110,7 +112,7 @@ if DATABASE_URL:
         opts['keepalives_idle'] = 30
         opts['keepalives_interval'] = 10
         opts['keepalives_count'] = 5
-        opts['connect_timeout'] = 15
+        opts['connect_timeout'] = 5
 else:
     DATABASES = {
         'default': {

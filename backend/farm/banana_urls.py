@@ -2,6 +2,7 @@ from django.urls import path
 from . import banana_views
 
 urlpatterns = [
+    path('photos/<str:kind>/<int:pk>/', banana_views.banana_photo, name='banana_photo'),
     path('plantations/', banana_views.plantations_list_create, name='banana_plantations_list_create'),
     path('plantations/<str:pk>/', banana_views.plantation_detail, name='banana_plantation_detail'),
     path('growth-records/', banana_views.growth_records_list_create, name='banana_growth_records'),

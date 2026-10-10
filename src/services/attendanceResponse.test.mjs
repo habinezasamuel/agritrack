@@ -26,3 +26,16 @@ test('nested meeting data supports dates, counters, officer remarks and audit hi
   assert.equal(result.auditHistory[0].newStatus, 'PRESENT');
   assert.equal(raw.meeting_date, '2026-10-10');
 });
+
+test('automatic attendance confirmations update status, remarks and rate', () => {
+  const result = normalizeAttendanceResponse({
+    meeting_id: 9, meeting_status: 'IN_PROGRESS',
+    statistics: { total_invited: 4, present_count: 1, late_count: 1, absent_count: 1, excused_count: 1, attendance_rate: 50 },
+    records: [{ id: 12, status: 'EXCUSED', officer_remarks: 'Approved absence', recorded_at: '2026-10-10T20:00:00Z', updated_at: '2026-10-10T20:00:00Z' }],
+  });
+  assert.equal(result.meetingId, 9);
+  assert.equal(result.statistics.attendanceRate, 50);
+  assert.equal(result.records[0].status, 'EXCUSED');
+  assert.equal(result.records[0].officerRemarks, 'Approved absence');
+  assert.equal(result.records[0].recordedAt, '2026-10-10T20:00:00Z');
+});

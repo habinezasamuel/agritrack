@@ -5,6 +5,9 @@ import type {
   AdminRegisterReviewSummary,
   FarmerLocationDetails,
   AttendanceStatus,
+  AttendanceStats,
+  MeetingStatus,
+  AttendanceRecordItem,
 } from '../types';
 
 export interface CreateMeetingDto {
@@ -36,7 +39,32 @@ export interface AdminModifyAttendanceDto {
   remarks?: string;
 }
 
+interface SavedAttendanceMarks {
+  meetingId: number;
+  meetingStatus: MeetingStatus;
+  statistics: AttendanceStats;
+  records: { id: number; status: AttendanceStatus; officerRemarks: string; recordedBy: string | null; recordedAt: string | null; updatedAt: string }[];
+}
+
 class AttendanceService {
+  async saveEvaluation(meetingId: number, data: Record<string, number | string>): Promise<{ message: string; evaluation: AttendanceRecordItem['evaluation'] }> {
+    return normalizeAttendanceResponse(await api.post(`/attendance/meetings/${meetingId}/evaluations/`, data));
+  }
+  async saveAttendanceMarks(meetingId: number, records: RecordAttendanceItemDto[]): Promise<SavedAttendanceMarks> {
+    const url = `/attendance/meetings/${meetingId}/attendance/`;
+    try {
+      return normalizeAttendanceResponse(await api.post(url, { records, compact_response: true }, { timeout: 30000 }));
+    } catch (error) {
+      if ((error as Error & { isTimeout?: boolean }).isTimeout) {
+        try {
+          const confirmation = normalizeAttendanceResponse<SavedAttendanceMarks>(await api.get(url, undefined, { timeout: 15000 }));
+          if (records.every((requested) => confirmation.records.some((saved) => saved.id === requested.record_id && saved.status === requested.status && saved.officerRemarks === (requested.remarks || '')))) return confirmation;
+        } catch { /* Keep the original save error and the user's choices. */ }
+      }
+      throw error;
+    }
+  }
+  private pendingMeetingKeys = new Map<string, string>();
   async getMeetingsPage(page = 1): Promise<{ meetings: MeetingItem[]; count: number }> {
     return normalizeAttendanceResponse(await api.get('/attendance/meetings/', { page, page_size: 25 }));
   }
@@ -44,8 +72,11 @@ class AttendanceService {
   async getRegisteredFarmersPage(search = '', page = 1): Promise<{ farmers: FarmerLocationDetails[]; count: number }> {
     return normalizeAttendanceResponse(await api.get('/attendance/farmers-roster/', { page, page_size: 50, search }));
   }
-  private async saveMeeting(url: string, data?: unknown): Promise<{ message: string; meeting: MeetingItem; audit_id: number }> {
-    const response = await api.post<{ message: string; meeting: unknown; audit_id: number }>(url, data);
+  private async saveMeeting(url: string, data?: unknown, submissionKey?: string): Promise<{ message: string; meeting: MeetingItem; audit_id: number }> {
+    const response = await api.post<{ message: string; meeting: unknown; audit_id: number }>(url, data, {
+      timeout: 30000,
+      ...(submissionKey ? { headers: { 'Idempotency-Key': submissionKey } } : {}),
+    });
     if (!response.meeting || typeof response.meeting !== 'object' || !('id' in response.meeting)) {
       throw new Error('The server did not confirm the saved meeting. Check your records before submitting again.');
     }
@@ -71,7 +102,23 @@ class AttendanceService {
    * Create a new meeting (Agricultural Officer ONLY).
    */
   async createMeeting(data: CreateMeetingDto): Promise<{ message: string; meeting: MeetingItem }> {
-    return this.saveMeeting('/attendance/meetings/', data);
+    const fingerprint = JSON.stringify([api.getUser()?.id, data]);
+    const key = this.pendingMeetingKeys.get(fingerprint) || crypto.randomUUID();
+    this.pendingMeetingKeys.set(fingerprint, key);
+    let result: { message: string; meeting: MeetingItem };
+    try {
+      result = await this.saveMeeting('/attendance/meetings/', data, key);
+    } catch (error) {
+      if (!(error as Error & { isTimeout?: boolean }).isTimeout) throw error;
+      // Read the committed confirmation rather than blindly repeating a save.
+      try {
+        result = normalizeAttendanceResponse(await api.get(`/attendance/meeting-submissions/${key}/`, undefined, { timeout: 10000 }));
+      } catch {
+        throw error;
+      }
+    }
+    this.pendingMeetingKeys.delete(fingerprint);
+    return result;
   }
 
   /**
@@ -108,7 +155,17 @@ class AttendanceService {
    * Finalize the attendance register after the meeting (Agricultural Officer ONLY).
    */
   async finalizeAttendanceRegister(meetingId: number | string): Promise<{ message: string; meeting: MeetingItem }> {
-    return this.saveMeeting(`/attendance/meetings/${meetingId}/finalize-register/`);
+    try {
+      return await this.saveMeeting(`/attendance/meetings/${meetingId}/finalize-register/`);
+    } catch (error) {
+      if ((error as Error & { isTimeout?: boolean }).isTimeout) {
+        try {
+          const meeting = await this.getMeetingDetail(meetingId);
+          if (meeting.register?.isFinalized) return { message: 'Attendance register finalized successfully.', meeting };
+        } catch { /* Preserve the save error when the database cannot confirm it. */ }
+      }
+      throw error;
+    }
   }
 
   /**

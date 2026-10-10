@@ -899,6 +899,19 @@ class Meeting(models.Model):
         return f"{self.title} ({self.meeting_date})"
 
 
+class MeetingSubmission(models.Model):
+    """Committed meeting response used to safely repeat a timed-out submission."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    key = models.UUIDField()
+    request_hash = models.CharField(max_length=64)
+    meeting = models.ForeignKey(Meeting, on_delete=models.CASCADE)
+    response = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['user', 'key'], name='unique_meeting_submission')]
+
+
 class MeetingInvitation(models.Model):
     INVITATION_STATUS_CHOICES = [
         ('INVITED', 'Invited'),
@@ -967,6 +980,40 @@ class AttendanceRecord(models.Model):
 
     def __str__(self):
         return f"{self.farmer.user.username} - {self.status} at {self.meeting.title}"
+
+
+class FarmerEvaluation(models.Model):
+    """A farmer's independent, officer-attributed evaluation for a meeting."""
+    attendance_record = models.OneToOneField(AttendanceRecord, on_delete=models.CASCADE, related_name='evaluation')
+    attendance_marks = models.DecimalField(max_digits=6, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    attendance_max = models.DecimalField(max_digits=6, decimal_places=2, default=20, validators=[MinValueValidator(0)])
+    participation_marks = models.DecimalField(max_digits=6, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    participation_max = models.DecimalField(max_digits=6, decimal_places=2, default=30, validators=[MinValueValidator(0)])
+    activity_marks = models.DecimalField(max_digits=6, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    activity_max = models.DecimalField(max_digits=6, decimal_places=2, default=50, validators=[MinValueValidator(0)])
+    practical_marks = models.DecimalField(max_digits=6, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    practical_max = models.DecimalField(max_digits=6, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    remarks = models.TextField(blank=True, default='')
+    evaluated_by = models.ForeignKey(UserProfile, on_delete=models.PROTECT, related_name='farmer_evaluations')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['attendance_record'], name='unique_meeting_farmer_evaluation')]
+
+
+class AttendanceGradingRule(models.Model):
+    """Editable grade thresholds maintained by administrators in Django admin."""
+    label = models.CharField(max_length=40, unique=True)
+    minimum_percent = models.DecimalField(max_digits=5, decimal_places=2, validators=[MinValueValidator(0)])
+    maximum_percent = models.DecimalField(max_digits=5, decimal_places=2, validators=[MinValueValidator(0)])
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', '-minimum_percent']
+
+    def __str__(self):
+        return f"{self.label} ({self.minimum_percent}–{self.maximum_percent}%)"
 
 
 class AttendanceModificationHistory(models.Model):

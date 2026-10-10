@@ -2,12 +2,14 @@ from django.urls import path
 from . import attendance_views
 
 urlpatterns = [
+    path('meeting-submissions/<uuid:key>/', attendance_views.meeting_submission_status, name='meeting_submission_status'),
     # Meetings & Attendance Register (Officer / All authorized)
     path('meetings/', attendance_views.meetings_list_create, name='meetings_list_create'),
     path('meetings/<int:meeting_id>/', attendance_views.meeting_detail, name='meeting_detail'),
     path('meetings/<int:meeting_id>/invite/', attendance_views.invite_farmers, name='invite_farmers'),
     path('meetings/<int:meeting_id>/generate-register/', attendance_views.generate_attendance_register, name='generate_attendance_register'),
     path('meetings/<int:meeting_id>/attendance/', attendance_views.record_attendance, name='record_attendance'),
+    path('meetings/<int:meeting_id>/evaluations/', attendance_views.meeting_evaluations, name='meeting_evaluations'),
     path('meetings/<int:meeting_id>/finalize-register/', attendance_views.finalize_attendance_register, name='finalize_attendance_register'),
 
     # Administrator Attendance Review & Modifications

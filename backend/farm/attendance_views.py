@@ -1,21 +1,27 @@
 import json
+import hashlib
+from uuid import UUID
 from collections import Counter
 from functools import wraps
 from datetime import datetime
 from django.core.exceptions import ValidationError
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
 from django.utils import timezone
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, Prefetch
 from django.contrib.auth.models import User
 from .models import (
     UserProfile,
     Meeting,
+    MeetingSubmission,
     MeetingInvitation,
     MeetingAttendanceRegister,
     AttendanceRecord,
     AttendanceModificationHistory,
+    FarmerEvaluation,
+    AttendanceGradingRule,
 )
 from .auth_utils import get_authenticated_user
 
@@ -79,9 +85,9 @@ def serialize_farmer(profile):
     }
 
 
-def serialize_meeting(meeting, include_records=True):
+def serialize_meeting(meeting, include_records=True, created_invitations=None):
     """Serialize Meeting object to JSON-compatible dict."""
-    has_register = hasattr(meeting, 'attendance_register') and meeting.attendance_register is not None
+    has_register = created_invitations is None and hasattr(meeting, 'attendance_register') and meeting.attendance_register is not None
     register_data = None
 
     if has_register:
@@ -115,7 +121,11 @@ def serialize_meeting(meeting, include_records=True):
         'role': 'Agricultural Officer',
     }
 
-    stats = compute_meeting_stats(meeting)
+    if created_invitations is None:
+        stats = compute_meeting_stats(meeting)
+    else:
+        stats = {key: 0 for key in ('present_count', 'absent_count', 'late_count', 'excused_count', 'unrecorded_count', 'attended_count', 'attendance_rate', 'modifications_count')}
+        stats['total_invited'] = len(created_invitations)
 
     meeting_date_str = meeting.meeting_date.isoformat() if hasattr(meeting.meeting_date, 'isoformat') else str(meeting.meeting_date)
 
@@ -141,7 +151,10 @@ def serialize_meeting(meeting, include_records=True):
 
     if include_records:
         # Invited farmers
-        invitations = meeting.invitations.select_related('farmer__user').all()
+        invitations = created_invitations if created_invitations is not None else (
+            meeting.invitations.all() if 'invitations' in getattr(meeting, '_prefetched_objects_cache', {})
+            else meeting.invitations.select_related('farmer__user').all()
+        )
         data['invited_farmers'] = [
             {
                 'invitation_id': inv.id,
@@ -153,9 +166,10 @@ def serialize_meeting(meeting, include_records=True):
         ]
 
         # Attendance records
-        records = meeting.attendance_records.select_related(
-            'farmer__user', 'recorded_by__user', 'last_modified_by__user'
-        ).all()
+        records = () if created_invitations is not None else (
+            meeting.attendance_records.all() if 'attendance_records' in getattr(meeting, '_prefetched_objects_cache', {})
+            else meeting.attendance_records.select_related('farmer__user', 'recorded_by__user', 'last_modified_by__user', 'evaluation__evaluated_by__user').all()
+        )
 
         data['records'] = [
             {
@@ -174,12 +188,16 @@ def serialize_meeting(meeting, include_records=True):
                 'last_modified_role': rec.last_modified_role,
                 'admin_remarks': rec.admin_remarks or '',
                 'updated_at': rec.updated_at.isoformat(),
+                'evaluation': _serialize_evaluation(rec),
             }
             for rec in records
         ]
 
         # Audit modification history
-        audits = meeting.attendance_audits.select_related('modified_by__user', 'farmer__user').order_by('-timestamp')
+        audits = () if created_invitations is not None else (
+            meeting.attendance_audits.all() if 'attendance_audits' in getattr(meeting, '_prefetched_objects_cache', {})
+            else meeting.attendance_audits.select_related('modified_by__user', 'farmer__user').order_by('-timestamp')
+        )
         data['audit_history'] = [
             {
                 'id': a.id,
@@ -202,11 +220,78 @@ def serialize_meeting(meeting, include_records=True):
     return data
 
 
+def _serialize_evaluation(record):
+    try:
+        evaluation = record.evaluation
+    except FarmerEvaluation.DoesNotExist:
+        return None
+    total = evaluation.attendance_marks + evaluation.participation_marks + evaluation.activity_marks + evaluation.practical_marks
+    maximum = evaluation.attendance_max + evaluation.participation_max + evaluation.activity_max + evaluation.practical_max
+    percent = round(float(total / maximum * 100), 1) if maximum else 0
+    rule = AttendanceGradingRule.objects.filter(minimum_percent__lte=percent, maximum_percent__gte=percent).order_by('-minimum_percent').first()
+    return {
+        'attendance_marks': float(evaluation.attendance_marks), 'attendance_max': float(evaluation.attendance_max),
+        'participation_marks': float(evaluation.participation_marks), 'participation_max': float(evaluation.participation_max),
+        'activity_marks': float(evaluation.activity_marks), 'activity_max': float(evaluation.activity_max),
+        'practical_marks': float(evaluation.practical_marks), 'practical_max': float(evaluation.practical_max),
+        'total': float(total), 'maximum': float(maximum), 'percentage': percent,
+        'grade': rule.label if rule else 'Not graded', 'remarks': evaluation.remarks,
+        'evaluated_by': evaluation.evaluated_by.user.get_full_name() or evaluation.evaluated_by.user.username,
+        'updated_at': evaluation.updated_at.isoformat(),
+    }
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'POST'])
+def meeting_evaluations(request, meeting_id):
+    user, profile, role = get_user_and_profile(request)
+    if not user:
+        return JsonResponse({'error': 'Unauthorized'}, status=401)
+    try:
+        meeting = Meeting.objects.get(pk=meeting_id)
+    except Meeting.DoesNotExist:
+        return JsonResponse({'error': 'Meeting not found'}, status=404)
+    if role == 'officer' and meeting.created_by_officer_id != profile.id:
+        return JsonResponse({'error': 'You are not authorized to manage this meeting.'}, status=403)
+    if role not in {'officer', 'admin'}:
+        return JsonResponse({'error': 'Only authorized officers can view or save evaluations.'}, status=403)
+    if request.method == 'GET':
+        return JsonResponse({'evaluations': {str(record.pk): _serialize_evaluation(record) for record in meeting.attendance_records.select_related('evaluation__evaluated_by__user')}})
+    if role != 'officer':
+        return JsonResponse({'error': 'Only the meeting officer can save evaluations.'}, status=403)
+    if not meeting.attendance_register_id or meeting.attendance_register.is_finalized:
+        return JsonResponse({'error': 'Evaluations require an open attendance register.'}, status=400)
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+        record_id = body.get('record_id')
+        values = {}
+        for field in ('attendance_marks', 'attendance_max', 'participation_marks', 'participation_max', 'activity_marks', 'activity_max', 'practical_marks', 'practical_max'):
+            value = body.get(field, 0)
+            if isinstance(value, bool): raise ValueError('Marks must be numeric.')
+            number = float(value)
+            if not (number >= 0 and number < float('inf')): raise ValueError('Marks must be non-negative finite numbers.')
+            values[field] = number
+        for score, maximum in (('attendance_marks','attendance_max'), ('participation_marks','participation_max'), ('activity_marks','activity_max'), ('practical_marks','practical_max')):
+            if values[score] > values[maximum]: raise ValueError(f'{score.replace("_", " ").title()} cannot exceed its maximum.')
+        remarks = body.get('remarks', '')
+        if not isinstance(remarks, str): raise ValueError('Remarks must be text.')
+    except (ValueError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+        return JsonResponse({'error': str(exc) or 'Enter valid evaluation marks.'}, status=400)
+    record = meeting.attendance_records.filter(pk=record_id).first()
+    if not record:
+        return JsonResponse({'error': 'Attendance record not found in this meeting.'}, status=404)
+    if record.status in {'ABSENT', 'EXCUSED', 'UNRECORDED'} and any(values[k] > 0 for k in ('attendance_marks', 'participation_marks', 'activity_marks', 'practical_marks')):
+        return JsonResponse({'error': 'Absent, excused, and unmarked farmers cannot receive marks without an administrator policy override.'}, status=400)
+    with transaction.atomic():
+        evaluation, _ = FarmerEvaluation.objects.update_or_create(attendance_record=record, defaults={**values, 'remarks': remarks, 'evaluated_by': profile})
+    return JsonResponse({'message': 'Evaluation saved successfully.', 'evaluation': _serialize_evaluation(record)})
+
+
 def validate_farmer_ids(raw_ids):
     if not isinstance(raw_ids, list) or any(type(item) is not int or item <= 0 for item in raw_ids):
         raise ValidationError({'farmer_ids': ['Select valid registered farmer IDs.']})
     ids = set(raw_ids)
-    farmers = list(UserProfile.objects.filter(pk__in=ids, role='farmer', user__is_active=True))
+    farmers = list(UserProfile.objects.filter(pk__in=ids, role='farmer', user__is_active=True).select_related('user'))
     if len(farmers) != len(ids):
         raise ValidationError({'farmer_ids': ['One or more selected farmers are unavailable. Refresh the farmer list.']})
     return farmers
@@ -286,6 +371,22 @@ def meetings_list_create(request):
         except Exception:
             return JsonResponse({'error': 'Invalid JSON body'}, status=400)
 
+        submission_key = request.headers.get('Idempotency-Key')
+        request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        if submission_key:
+            try:
+                submission_key = UUID(submission_key)
+            except (ValueError, TypeError):
+                return JsonResponse({'error': 'Invalid submission key'}, status=400)
+            # Serialize repeated saves for this officer until the first commit
+            # finishes, then return its saved response instead of a second row.
+            UserProfile.objects.select_for_update().get(pk=profile.pk)
+            saved = MeetingSubmission.objects.filter(user=user, key=submission_key).first()
+            if saved:
+                if saved.request_hash != request_hash:
+                    return JsonResponse({'error': 'This submission key was already used for different meeting details.'}, status=409)
+                return JsonResponse(saved.response, status=201)
+
         if any(not isinstance(body.get(key, ''), str) for key in ('title', 'venue', 'description', 'agenda')):
             return JsonResponse({'error': 'Title, venue, description, and agenda must be text.'}, status=400)
         title = body.get('title', '').strip()
@@ -321,16 +422,19 @@ def meetings_list_create(request):
             status='SCHEDULED',
         )
 
-        meeting.full_clean()
+        meeting.full_clean(exclude=['created_by_officer'])
         meeting.save()
-        MeetingInvitation.objects.bulk_create([
+        invitations = MeetingInvitation.objects.bulk_create([
             MeetingInvitation(meeting=meeting, farmer=farmer) for farmer in farmers
         ])
 
-        return JsonResponse({
+        response = {
             'message': 'Meeting created successfully.',
-            'meeting': serialize_meeting(meeting, include_records=True),
-        }, status=201)
+            'meeting': serialize_meeting(meeting, include_records=True, created_invitations=invitations),
+        }
+        if submission_key:
+            MeetingSubmission.objects.create(user=user, key=submission_key, request_hash=request_hash, meeting=meeting, response=response)
+        return JsonResponse(response, status=201)
 
     return JsonResponse({'error': 'Method not allowed'}, status=405)
 
@@ -338,6 +442,19 @@ def meetings_list_create(request):
 # ==============================================================
 # 2. MEETING DETAIL
 # ==============================================================
+
+@require_http_methods(['GET'])
+def meeting_submission_status(request, key):
+    user, profile, role = get_user_and_profile(request)
+    if not user:
+        return JsonResponse({'error': 'Unauthorized'}, status=401)
+    if role != 'officer':
+        return JsonResponse({'error': 'Officer permission required'}, status=403)
+    saved = MeetingSubmission.objects.filter(user=user, key=key).first()
+    if not saved:
+        return JsonResponse({'error': 'Save confirmation is not available yet. Check the meeting list.'}, status=404)
+    return JsonResponse(saved.response)
+
 
 @csrf_exempt
 def meeting_detail(request, meeting_id):
@@ -347,7 +464,13 @@ def meeting_detail(request, meeting_id):
         return JsonResponse({'error': 'Unauthorized'}, status=401)
 
     try:
-        meeting = Meeting.objects.get(id=meeting_id, **({'created_by_officer': profile} if role == 'officer' else {}))
+        meeting = Meeting.objects.select_related(
+            'created_by_officer__user', 'attendance_register__generated_by_officer__user', 'attendance_register__finalized_by__user',
+        ).prefetch_related(
+            Prefetch('invitations', queryset=MeetingInvitation.objects.select_related('farmer__user')),
+            Prefetch('attendance_records', queryset=AttendanceRecord.objects.select_related('farmer__user', 'recorded_by__user', 'last_modified_by__user', 'evaluation__evaluated_by__user')),
+            Prefetch('attendance_audits', queryset=AttendanceModificationHistory.objects.order_by('-timestamp')),
+        ).get(id=meeting_id, **({'created_by_officer': profile} if role == 'officer' else {}))
     except Meeting.DoesNotExist:
         return JsonResponse({'error': 'Meeting not found'}, status=404)
 
@@ -490,7 +613,23 @@ def generate_attendance_register(request, meeting_id):
 # 5. OFFICER RECORD / SAVE ATTENDANCE
 # ==============================================================
 
+def _attendance_marks_response(meeting, records):
+    return JsonResponse({
+        'message': 'Attendance saved successfully.',
+        'meeting_id': meeting.pk, 'meeting_status': meeting.status,
+        'statistics': compute_meeting_stats(meeting),
+        'records': [{
+            'id': record.pk, 'status': record.status,
+            'officer_remarks': record.officer_remarks,
+            'recorded_by': (record.recorded_by.user.get_full_name() or record.recorded_by.user.username) if record.recorded_by else None,
+            'recorded_at': record.recorded_at.isoformat() if record.recorded_at else None,
+            'updated_at': record.updated_at.isoformat(),
+        } for record in records],
+    })
+
+
 @csrf_exempt
+@require_http_methods(['GET', 'POST', 'PUT'])
 def record_attendance(request, meeting_id):
     """
     POST / PUT: Agricultural Officer marks and saves attendance.
@@ -515,6 +654,9 @@ def record_attendance(request, meeting_id):
         return JsonResponse({
             'error': 'Attendance register has not been generated for this meeting yet. Please click "Generate Attendance Register" first.'
         }, status=400)
+
+    if request.method == 'GET':
+        return _attendance_marks_response(meeting, meeting.attendance_records.select_related('recorded_by__user'))
 
     if meeting.attendance_register.is_finalized:
         return JsonResponse({'error': 'This register is finalized. An administrator must review any corrections.'}, status=400)
@@ -563,6 +705,8 @@ def record_attendance(request, meeting_id):
             meeting.status = 'IN_PROGRESS'
             meeting.save()
 
+    if body.get('compact_response') is True:
+        return _attendance_marks_response(meeting, updated)
     return JsonResponse({
         'message': f'Attendance register saved successfully. Updated {updated_count} record(s).',
         'meeting': serialize_meeting(meeting, include_records=True),

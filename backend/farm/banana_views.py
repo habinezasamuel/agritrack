@@ -1,9 +1,11 @@
 import json
+import base64
+import binascii
 from datetime import datetime
 
 from django.db import transaction
-from django.db.models import OuterRef, Subquery, Sum
-from django.http import JsonResponse
+from django.db.models import OuterRef, Subquery, Sum, Count, Q, Case, When, Value, F, TextField
+from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.utils import timezone
@@ -77,6 +79,52 @@ def _accessible_assistance_requests(user):
         return BananaAssistanceRequest.objects.filter(assigned_officer=profile)
     return BananaAssistanceRequest.objects.none()
 
+
+def _without_inline_photos(queryset):
+    # PostgreSQL evaluates the prefix locally; large image strings stay off the
+    # database connection during list loading. No records or photos are changed.
+    return queryset.defer('photo_url').annotate(photo_reference=Case(
+        When(photo_url__startswith='data:', then=Value('__inline_photo__')),
+        default=F('photo_url'), output_field=TextField(),
+    ))
+
+
+def _photo_reference(record, kind):
+    reference = record.photo_reference if hasattr(record, 'photo_reference') else record.photo_url
+    if reference == '__inline_photo__' or (reference and reference.startswith('data:')):
+        version = getattr(record, 'updated_at', record.created_at).timestamp()
+        return f'/api/banana/photos/{kind}/{record.pk}/?v={version}'
+    return reference or ''
+
+
+@require_http_methods(['GET'])
+def banana_photo(request, kind, pk):
+    user = get_authenticated_user(request)
+    if user is None:
+        return JsonResponse({'message': 'Authentication required'}, status=401)
+    sources = {
+        'plantation': _accessible_plantations,
+        'growth': _accessible_growth_logs,
+        'disease': _accessible_disease_reports,
+        'weather': _accessible_weather_reports,
+    }
+    source = sources.get(kind)
+    record = source(user).only('photo_url').filter(pk=pk).first() if source else None
+    if record is None or not record.photo_url:
+        return JsonResponse({'message': 'Photo not found'}, status=404)
+    try:
+        header, encoded = record.photo_url.split(',', 1)
+        mime = header.removeprefix('data:').split(';')[0]
+        if mime not in ('image/png', 'image/jpeg', 'image/webp', 'image/gif', 'image/avif') or ';base64' not in header:
+            raise ValueError
+        content = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        return JsonResponse({'message': 'Photo format unavailable'}, status=400)
+    response = HttpResponse(content, content_type=mime)
+    response['Cache-Control'] = 'private, max-age=86400'
+    response['X-Content-Type-Options'] = 'nosniff'
+    return response
+
 def serialize_plantation(p):
     return {
         'id': str(p.id),
@@ -91,7 +139,7 @@ def serialize_plantation(p):
         'soilType': 'Volcanic Loam',
         'irrigationMethod': 'Rainfed with Swales & Mulch',
         'location': p.farm.location if p.farm else 'Ruhango District',
-        'photoUrl': p.photo_url or '',
+        'photoUrl': _photo_reference(p, 'plantation'),
         'notes': p.notes or '',
         'status': 'SHOOTING' if p.status == 'FLOWERING_SHOOTING' else ('HARVEST_READY' if p.status == 'HARVESTING_READY' else 'GROWING'),
         'createdAt': _safe_iso(p.created_at),
@@ -99,6 +147,7 @@ def serialize_plantation(p):
     }
 
 def serialize_growth_log(g):
+    photo = _photo_reference(g, 'growth')
     return {
         'id': str(g.id),
         'plantationId': str(g.plantation.id),
@@ -110,16 +159,19 @@ def serialize_growth_log(g):
         'healthyPlantsCount': g.healthy_plants,
         'damagedPlantsCount': g.damaged_plants,
         'observations': g.general_observations or '',
-        'photos': [g.photo_url] if g.photo_url else [],
+        'photos': [photo] if photo else [],
         'recordedByName': g.recorded_by.user.get_full_name() if g.recorded_by else 'Farmer Hakizimana',
         'createdAt': _safe_iso(g.created_at),
     }
 
 def serialize_disease_report(d):
-    advice = d.plantation.assistance_requests.filter(disease_report=d).first()
+    photo = _photo_reference(d, 'disease')
+    requests = list(d.assistance_requests.all())
+    advice = requests[0] if requests else None
     officer_advice = None
-    if advice and advice.officer_advices.exists():
-        first_adv = advice.officer_advices.first()
+    advices = list(advice.officer_advices.all()) if advice else []
+    if advices:
+        first_adv = advices[0]
         officer_advice = {
             'id': str(first_adv.id),
             'requestId': str(advice.id),
@@ -151,7 +203,7 @@ def serialize_disease_report(d):
         'description': d.description,
         'affectedPlantsCount': d.affected_plants_count,
         'location': d.location_details or 'Ruhango District',
-        'photos': [d.photo_url] if d.photo_url else [],
+        'photos': [photo] if photo else [],
         'notes': d.additional_notes or '',
         'assistanceRequested': d.request_assistance,
         'status': d.status,
@@ -161,6 +213,7 @@ def serialize_disease_report(d):
     }
 
 def serialize_weather_report(w):
+    photo = _photo_reference(w, 'weather')
     year_str = w.created_at.strftime('%Y') if hasattr(w.created_at, 'strftime') else '2024'
     return {
         'id': str(w.id),
@@ -175,7 +228,7 @@ def serialize_weather_report(w):
         'damageLevel': w.damage_level,
         'affectedPlantsCount': w.affected_plants_estimate,
         'description': w.description,
-        'photos': [w.photo_url] if w.photo_url else [],
+        'photos': [photo] if photo else [],
         'assistanceRequested': w.request_assistance,
         'status': 'REVIEWED',
         'createdAt': _safe_iso(w.created_at),
@@ -231,7 +284,7 @@ def plantations_list_create(request):
         return JsonResponse({'message': 'Authentication required'}, status=401)
 
     if request.method == "GET":
-        plantations = _accessible_plantations(user).select_related('farmer__user', 'farm')
+        plantations = _without_inline_photos(_accessible_plantations(user)).select_related('farmer__user', 'farm')
         return JsonResponse([serialize_plantation(p) for p in plantations], safe=False)
 
     try:
@@ -357,7 +410,7 @@ def growth_records_list_create(request):
 
     if request.method == "GET":
         plantation_id = request.GET.get('plantation_id')
-        records = _accessible_growth_logs(user).select_related('plantation', 'recorded_by__user')
+        records = _without_inline_photos(_accessible_growth_logs(user)).select_related('plantation', 'recorded_by__user').defer('plantation__photo_url')
         if plantation_id:
             records = records.filter(plantation_id=plantation_id)
         return JsonResponse([serialize_growth_log(g) for g in records], safe=False)
@@ -406,7 +459,7 @@ def disease_reports_list_create(request):
         return JsonResponse({'message': 'Authentication required'}, status=401)
 
     if request.method == "GET":
-        reports = _accessible_disease_reports(user).select_related('plantation', 'farmer__user')
+        reports = _without_inline_photos(_accessible_disease_reports(user)).select_related('plantation', 'farmer__user').defer('plantation__photo_url').prefetch_related('assistance_requests__officer_advices__officer__user')
         return JsonResponse([serialize_disease_report(d) for d in reports], safe=False)
 
     try:
@@ -446,7 +499,7 @@ def weather_reports_list_create(request):
         return JsonResponse({'message': 'Authentication required'}, status=401)
 
     if request.method == "GET":
-        reports = _accessible_weather_reports(user).select_related('plantation', 'farmer__user')
+        reports = _without_inline_photos(_accessible_weather_reports(user)).select_related('plantation', 'farmer__user').defer('plantation__photo_url')
         return JsonResponse([serialize_weather_report(w) for w in reports], safe=False)
 
     try:
@@ -483,7 +536,7 @@ def assistance_requests_list_create(request):
         return JsonResponse({'message': 'Authentication required'}, status=401)
 
     if request.method == "GET":
-        requests_qs = _accessible_assistance_requests(user).select_related('plantation', 'farmer__user', 'assigned_officer__user').prefetch_related('officer_advices__officer__user')
+        requests_qs = _accessible_assistance_requests(user).select_related('plantation', 'farmer__user', 'assigned_officer__user').defer('plantation__photo_url').prefetch_related('officer_advices__officer__user')
         return JsonResponse([serialize_assistance_request(r) for r in requests_qs], safe=False)
 
     try:
@@ -597,31 +650,46 @@ def banana_dashboard_summary(request):
     weather_reports = _accessible_weather_reports(user)
     assistance_requests = _accessible_assistance_requests(user)
 
-    total_plants = plantations.aggregate(total=Sum('total_plants_planted'))['total'] or 0
+    planted = plantations.aggregate(total=Sum('total_plants_planted'), fields=Count('pk'))
+    total_plants = planted['total'] or 0
     latest = BananaGrowthLog.objects.filter(plantation_id=OuterRef('plantation_id')).order_by('-date', '-created_at', '-pk')
     monitoring = _accessible_growth_logs(user).filter(pk=Subquery(latest.values('pk')[:1]))
-    observed = monitoring.aggregate(healthy=Sum('healthy_plants'), affected=Sum('damaged_plants'))
+    observed = monitoring.aggregate(healthy=Sum('healthy_plants'), affected=Sum('damaged_plants'), fields=Count('pk'))
     healthy_plants = observed['healthy'] or 0
     affected_plants = observed['affected'] or 0
     observed_total = healthy_plants + affected_plants
 
     active_diseases = disease_reports.exclude(status__in=['RESOLVED', 'CLOSED']).count()
-    pending_assistance = assistance_requests.filter(status='PENDING').count()
-    resolved_problems = assistance_requests.filter(status='RESOLVED').count()
+    requests_counts = assistance_requests.aggregate(
+        pending=Count('pk', filter=Q(status='PENDING')),
+        resolved=Count('pk', filter=Q(status='RESOLVED')),
+    )
+    pending_assistance = requests_counts['pending']
+    resolved_problems = requests_counts['resolved']
 
     health_rate = round((healthy_plants / observed_total) * 100, 1) if observed_total > 0 else None
 
-    return JsonResponse({
-        'totalPlantations': plantations.count(),
+    summary = {
+        'totalPlantations': planted['fields'],
         'totalPlants': total_plants,
         'healthyPlants': healthy_plants,
         'affectedPlants': affected_plants,
         'healthRatePercent': health_rate,
-        'monitoredFieldsCount': monitoring.count(),
+        'monitoredFieldsCount': observed['fields'],
         'weatherReportingPeriod': 'All recorded events',
         'resolvedProblemsDefinition': 'Resolved assistance requests',
         'activeDiseaseReports': active_diseases,
         'weatherReportsCount': weather_reports.count(),
         'pendingAssistanceRequests': pending_assistance,
         'resolvedProblemsCount': resolved_problems,
-    })
+    }
+    if getattr(request, 'GET', {}).get('include_records') == '1':
+        return JsonResponse({
+            'summary': summary,
+            'plantations': [serialize_plantation(item) for item in _without_inline_photos(plantations).select_related('farm')],
+            'growthRecords': [serialize_growth_log(item) for item in _without_inline_photos(_accessible_growth_logs(user)).select_related('plantation', 'recorded_by__user').defer('plantation__photo_url')],
+            'diseaseReports': [serialize_disease_report(item) for item in _without_inline_photos(disease_reports).select_related('plantation', 'farmer__user').defer('plantation__photo_url').prefetch_related('assistance_requests__officer_advices__officer__user')],
+            'weatherReports': [serialize_weather_report(item) for item in _without_inline_photos(weather_reports).select_related('plantation', 'farmer__user').defer('plantation__photo_url')],
+            'assistanceRequests': [serialize_assistance_request(item) for item in assistance_requests.select_related('plantation', 'farmer__user', 'assigned_officer__user').defer('plantation__photo_url').prefetch_related('officer_advices__officer__user')],
+        })
+    return JsonResponse(summary)

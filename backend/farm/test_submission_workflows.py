@@ -1,14 +1,17 @@
 import json
+from uuid import uuid4
 from datetime import date
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
+from django.contrib.auth.models import AnonymousUser
 from django.db import connection, OperationalError
 from django.test import Client, RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from .attendance_views import meetings_list_create
-from .models import UserProfile, Meeting, MeetingInvitation, AttendanceRecord
+from .middleware import BearerTokenAuthMiddleware
+from .models import UserProfile, Meeting, MeetingInvitation, AttendanceRecord, MeetingSubmission
 
 
 class SubmissionWorkflowTests(TestCase):
@@ -127,3 +130,100 @@ class SubmissionWorkflowTests(TestCase):
         self.assertEqual(response.json()['count'], 1)
         self.assertEqual(response.json()['farmers'][0]['id'], self.farmer_profile.pk)
         self.assertEqual(self.client.get('/api/attendance/farmers-roster/?page=0').status_code, 400)
+
+    def test_repeating_submission_returns_committed_meeting(self):
+        key = str(uuid4())
+        first = self.client.post('/api/attendance/meetings/', json.dumps(self.payload), content_type='application/json', HTTP_IDEMPOTENCY_KEY=key)
+        self.assertEqual(first.status_code, 201)
+        repeated = self.client.post('/api/attendance/meetings/', json.dumps(self.payload), content_type='application/json', HTTP_IDEMPOTENCY_KEY=key)
+        self.assertEqual(repeated.status_code, 201)
+        self.assertEqual(first.json()['meeting']['id'], repeated.json()['meeting']['id'])
+        self.assertEqual(Meeting.objects.count(), 1)
+        self.assertEqual(MeetingInvitation.objects.count(), 1)
+        self.assertEqual(MeetingSubmission.objects.count(), 1)
+        confirmation = self.client.get(f'/api/attendance/meeting-submissions/{key}/')
+        self.assertEqual(confirmation.status_code, 200)
+        self.assertEqual(confirmation.json()['meeting']['id'], first.json()['meeting']['id'])
+        other = User.objects.create_user('confirmation-other-officer')
+        UserProfile.objects.create(user=other, role='officer')
+        self.client.force_login(other)
+        self.assertEqual(self.client.get(f'/api/attendance/meeting-submissions/{key}/').status_code, 404)
+
+    def test_create_response_does_not_requery_attendance_statistics(self):
+        with patch('farm.attendance_views.compute_meeting_stats', side_effect=AssertionError('Unexpected statistics reload')):
+            response = self.create()
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['meeting']['statistics']['total_invited'], 1)
+        self.assertEqual(response.json()['meeting']['records'], [])
+
+    def test_compact_marks_save_all_four_statuses_and_calculate_rate(self):
+        ids = [self.farmer_profile.pk]
+        for number in range(3):
+            user = User.objects.create_user(f'attendance-farmer-{number}')
+            ids.append(UserProfile.objects.create(user=user, role='farmer').pk)
+        meeting_id = self.create({'farmer_ids': ids}).json()['meeting']['id']
+        self.client.post(f'/api/attendance/meetings/{meeting_id}/generate-register/')
+        records = list(AttendanceRecord.objects.filter(meeting_id=meeting_id).order_by('pk'))
+        marks = [{ 'record_id': record.pk, 'status': status, 'remarks': f'{status} recorded' }
+                 for record, status in zip(records, ['PRESENT', 'LATE', 'ABSENT', 'EXCUSED'])]
+        response = self.client.post(f'/api/attendance/meetings/{meeting_id}/attendance/', json.dumps({'records': marks, 'compact_response': True}), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertNotIn('meeting', data)
+        self.assertEqual(data['statistics']['attendance_rate'], 50)
+        for key in ('present_count', 'late_count', 'absent_count', 'excused_count'):
+            self.assertEqual(data['statistics'][key], 1)
+        for record, mark in zip(records, marks):
+            record.refresh_from_db()
+            self.assertEqual(record.status, mark['status'])
+            self.assertEqual(record.officer_remarks, mark['remarks'])
+            self.assertEqual(record.recorded_by_id, self.profile.pk)
+            self.assertIsNotNone(record.recorded_at)
+        fresh = Client()
+        fresh.force_login(self.officer)
+        self.assertEqual(fresh.get(f'/api/attendance/meetings/{meeting_id}/').json()['meeting']['statistics']['attendance_rate'], 50)
+        repeated = self.client.post(f'/api/attendance/meetings/{meeting_id}/attendance/', json.dumps({'records': marks, 'compact_response': True}), content_type='application/json')
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(AttendanceRecord.objects.filter(meeting_id=meeting_id).count(), 4)
+        confirmation = self.client.get(f'/api/attendance/meetings/{meeting_id}/attendance/')
+        self.assertEqual(confirmation.status_code, 200)
+        self.assertEqual(confirmation.json()['statistics']['attendance_rate'], 50)
+        self.assertEqual({row['status'] for row in confirmation.json()['records']}, {'PRESENT', 'LATE', 'ABSENT', 'EXCUSED'})
+
+    def test_finalized_register_rejects_automatic_marks(self):
+        meeting_id = self.create().json()['meeting']['id']
+        self.client.post(f'/api/attendance/meetings/{meeting_id}/generate-register/')
+        record = AttendanceRecord.objects.get(meeting_id=meeting_id)
+        register = record.register
+        register.is_finalized = True
+        register.save()
+        response = self.client.post(f'/api/attendance/meetings/{meeting_id}/attendance/', json.dumps({'records': [{'record_id': record.pk, 'status': 'PRESENT'}], 'compact_response': True}), content_type='application/json')
+        self.assertEqual(response.status_code, 400)
+        record.refresh_from_db()
+        self.assertEqual(record.status, 'UNRECORDED')
+
+    def test_database_failure_during_auth_returns_json_without_processing_save(self):
+        request = RequestFactory().post('/api/attendance/meetings/', '{}', content_type='application/json')
+        request.user = AnonymousUser()
+        handler = patch('farm.middleware.get_authenticated_user', side_effect=OperationalError('private connection details'))
+        with handler:
+            middleware = BearerTokenAuthMiddleware(lambda request: self.fail('Save handler must not run when authentication cannot access the database'))
+            response = middleware(request)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(json.loads(response.content)['code'], 'database_unavailable')
+        self.assertNotIn('private', response.content.decode())
+
+    def test_submission_key_cannot_be_reused_for_different_details(self):
+        key = str(uuid4())
+        self.client.post('/api/attendance/meetings/', json.dumps(self.payload), content_type='application/json', HTTP_IDEMPOTENCY_KEY=key)
+        response = self.client.post('/api/attendance/meetings/', json.dumps({**self.payload, 'title': 'Changed'}), content_type='application/json', HTTP_IDEMPOTENCY_KEY=key)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(Meeting.objects.count(), 1)
+
+    @override_settings(DEBUG=True)
+    def test_failed_submission_does_not_store_receipt(self):
+        with patch('farm.attendance_views.MeetingInvitation.objects.bulk_create', side_effect=OperationalError('private details')):
+            response = self.client.post('/api/attendance/meetings/', json.dumps(self.payload), content_type='application/json', HTTP_IDEMPOTENCY_KEY=str(uuid4()))
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(MeetingSubmission.objects.exists())
+        self.assertFalse(Meeting.objects.exists())

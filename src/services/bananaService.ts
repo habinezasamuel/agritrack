@@ -29,6 +29,15 @@ const mapOfficerAdvice = (a: any): BananaOfficerAdvice => ({
   createdAt: a.createdAt || '',
 });
 
+interface BananaDashboardData {
+  summary: BananaDashboardSummary;
+  plantations: BananaPlantation[];
+  growthRecords: BananaGrowthRecord[];
+  diseaseReports: BananaDiseaseReport[];
+  weatherReports: BananaWeatherReport[];
+  assistanceRequests: BananaAssistanceRequest[];
+}
+
 const mapWeatherReport = (w: any): BananaWeatherReport => ({
   id: String(w.id),
   reportNumber: w.reportNumber || '',
@@ -86,6 +95,24 @@ const mapAssistanceRequest = (r: any): BananaAssistanceRequest => ({
 });
 
 class BananaService {
+  private dashboardRequest: { token: string | null; promise: Promise<BananaDashboardData> } | null = null;
+
+  getDashboardData(): Promise<BananaDashboardData> {
+    const token = api.getAccessToken();
+    if (this.dashboardRequest?.token === token) return this.dashboardRequest.promise;
+    const promise = api.get<BananaDashboardData>('/banana/dashboard-summary/', { include_records: 1 }, { timeout: 30000 })
+      .then((data) => ({
+        ...data,
+        weatherReports: data.weatherReports.map(mapWeatherReport),
+        assistanceRequests: data.assistanceRequests.map(mapAssistanceRequest),
+      }));
+    const request = { token, promise };
+    this.dashboardRequest = request;
+    void promise.finally(() => {
+      if (this.dashboardRequest === request) this.dashboardRequest = null;
+    }).catch(() => {});
+    return promise;
+  }
   async syncWithBackend(): Promise<void> {
     try {
       await Promise.all([

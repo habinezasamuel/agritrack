@@ -41,3 +41,38 @@ npm.cmd run build
 
 The verification script invokes the summary view with existing accounts and
 performs no writes. It does not verify browser behavior or the token-login flow.
+
+## Dashboard loading
+
+The page now requests `/api/banana/dashboard-summary/?include_records=1` once
+instead of starting six separate list requests. Existing summary-only and list
+endpoints remain compatible. Concurrent dashboard requests share the same
+in-flight promise; responses are not cached as farm data.
+
+The combined read has a bounded 30-second timeout to accommodate Neon connection
+startup and the current database latency. Errors show the API's actual message,
+and a failed refresh keeps previously loaded statistics with a visible warning.
+
+Legacy base64 photos remain stored unchanged. List queries defer the photo field
+and return authorized image URLs. Photos load lazily through
+`/api/banana/photos/<kind>/<id>/` and enforce the same record ownership rules.
+Related plantation photo columns are also excluded from monitoring, disease,
+weather, and assistance list queries. This prevents database image transfers
+from blocking record loading.
+
+Dashboard aggregates combine related counts into fewer queries. Disease advice
+uses prefetched relationships instead of querying separately for each report.
+
+Additional checks:
+
+```powershell
+# Read-only live authenticated HTTP check; prints timing and response size
+.\.venv\Scripts\python.exe backend/verify_banana_loading.py
+
+# Optional read-only query timing (no record values printed)
+.\.venv\Scripts\python.exe backend/verify_banana_loading.py --direct
+```
+
+The live check returned HTTP 200 with all sections in 21.48 seconds and 7,763
+response bytes. Database latency is still noticeable; the dashboard no longer
+downloads embedded photos while loading records.

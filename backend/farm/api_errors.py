@@ -15,5 +15,8 @@ class ApiErrorMiddleware(MiddlewareMixin):
         if isinstance(exception, IntegrityError):
             return JsonResponse({'message': 'This record conflicts with existing information. Refresh your records and check the submitted details.'}, status=409)
         if isinstance(exception, DatabaseError):
-            return JsonResponse({'message': 'The database is temporarily unavailable. Check your records before submitting again.'}, status=503)
+            return JsonResponse({
+                'message': 'The database connection is temporarily unavailable. If you were saving a record, check whether it was saved before retrying.',
+                'code': 'database_unavailable',
+            }, status=503)
         return None
