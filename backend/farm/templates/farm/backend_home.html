@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgriTrack backend</title>
+  <style>
+    body { margin: 0; background: #f1f5f3; color: #18352b; font: 16px/1.6 system-ui, sans-serif; }
+    main { max-width: 620px; margin: 10vh auto; padding: 32px; background: white; border-radius: 20px; }
+    h1 { line-height: 1.2; }
+    a { color: #116149; }
+    .button { display: inline-block; padding: 12px 20px; border-radius: 10px; background: #116149; color: white; text-decoration: none; }
+    code { background: #eef4f0; padding: 4px 8px; border-radius: 5px; }
+    @media (max-width: 680px) { main { margin: 24px 16px; padding: 24px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AgriTrack backend is running</h1>
+    <p>This server provides AgriTrack's API. Open the frontend to sign in, view your dashboard, and use the AI assistant.</p>
+    {% if frontend_url %}
+      <p><a class="button" href="{{ frontend_url }}">Open AgriTrack</a></p>
+      <p>After signing in, select <strong>AI Farm Assistant</strong> in the menu.</p>
+    {% endif %}
+    {% if show_dev_commands %}
+      <p>If the frontend is not running, open another terminal in the project folder and run <code>npm.cmd run dev</code>. Use the Local URL printed by Vite if it differs from the link above.</p>
+    {% endif %}
+    <p>The backend running does not confirm that the AI provider is available. The assistant displays its service status when you ask a question.</p>
+  </main>
+</body>
+</html>
